@@ -150,7 +150,8 @@ services:
 
   langfuse-minio:
     profiles: ["observability"]
-    image: docker.io/minio/minio
+    # minio/minio saiu dos registries públicos; o Langfuse upstream usa a imagem da Chainguard
+    image: cgr.dev/chainguard/minio
     container_name: fc-langfuse-minio
     restart: unless-stopped
     entrypoint: sh

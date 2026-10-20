@@ -16,6 +16,7 @@ from langchain_postgres import PGVectorStore
 from psycopg import sql
 from pydantic import BaseModel, Field
 
+from app.access import DEFAULT_ACCESS, RequestAccessContext, visibility_filter
 from app.db import get_connection
 from app.index import TABLE_NAME
 
@@ -132,8 +133,14 @@ def ensure_planner_covers_index(*, table_name: str = TABLE_NAME) -> None:
         raise SystemExit(1)
 
 
-def build_filters(query_plan: QueryPlan) -> dict:
+def build_filters(
+    query_plan: QueryPlan, access: RequestAccessContext = DEFAULT_ACCESS
+) -> dict:
     filters = dict(SAFE_FILTERS)
+    # The caller's access scope, from the application — never from the planner, whose
+    # schema has no visibility field. A document outside it is never retrieved, so it
+    # never reaches the model.
+    filters["visibility"] = visibility_filter(access)
 
     if query_plan.doc_types:
         # A list, never a single value: the same answer can live in more than one kind

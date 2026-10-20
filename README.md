@@ -50,6 +50,64 @@ Isso responde *"esta origem está autorizada?"*, **não** *"este conteúdo é se
 origem autorizada ainda pode ser comprometida ou publicar conteúdo malicioso — ver SEC-002
 em [docs/security-threat-model.md](docs/security-threat-model.md).
 
+## Task scope
+
+Antes do RAG, um classificador (`app/task_scope.py`, política `task-scope-v1`) decide se a
+**tarefa** pedida é função do Knowledge Chat — responder sobre a documentação, não traduzir,
+escrever anúncio ou poema. Assunto do domínio não torna a tarefa do domínio. Tarefa recusada
+(ou falha do classificador) não chega ao planner nem ao retrieval e volta sem sources. A
+decisão é **probabilística** e **não é autorização**. Detalhes em
+[docs/pipeline.md](docs/pipeline.md) e [docs/security-threat-model.md](docs/security-threat-model.md).
+
+```bash
+pytest -m live                          # perguntas legítimas continuam permitidas (modelo real)
+```
+
+## OpenAI Guardrails experiment
+
+`openai-guardrails` 0.3.3 (preview) com dois checks em `config/openai_guardrails.json`:
+**Jailbreak** e um **Custom Prompt Check** escrito como regra de task scope. A evaluation
+roda os 33 ataques existentes e 10 perguntas legítimas, e reporta cada check separado —
+taxa por attack family, falsos positivos, falsos negativos onde há expectativa, latência e
+tokens; não existe score combinado. Também pode rodar no runtime, antes das políticas da
+aplicação, via API standalone (`run_guardrails`, sem gerar uma segunda resposta):
+`OPENAI_GUARDRAILS_ENABLED=true`, **desligado por padrão**. É um detector probabilístico
+sobre o texto; não substitui task scope, provenance, tool policy nem controle de acesso. A
+integração oficial com o OpenAI Agents SDK (`GuardrailAgent`) não é usada: o projeto é
+LangChain.
+
+```bash
+python -m app.eval_openai_guardrails --smoke   # 3 entradas
+python -m app.eval_openai_guardrails           # 33 ataques + 10 controles + comparação com task-scope-v1
+```
+
+## Document visibility and access context
+
+Provenance decide se uma **source** pode fornecer conhecimento; o `RequestAccessContext`
+(`app/access.py`) decide se o **caller** pode recebê-lo. A visibility permitida entra nos
+filtros **antes do retrieval**, então um documento fora do escopo nunca chega ao modelo — o
+LLM não decide acesso. O Knowledge Chat roda com `{public, internal}`; o corpus atual é todo
+`internal` e não tem disclosure indevido. O cenário com documentos `public` e `restricted`
+existe só para a security evaluation, numa collection isolada.
+
+```bash
+python -m app.eval_security_access    # cenário sintético isolado (fcai_security_access_control_v1)
+```
+
+## Tool policy and approval
+
+No Support Agent, a tool call do modelo é uma **proposta**; a aplicação decide se ela
+executa (`app/tool_policy.py`, política `tool-policy-v1`). O tenant vem do
+`AgentExecutionContext` que a aplicação entrega, nunca do modelo: `tenant_id` divergente é
+negado, não corrigido. `create_support_ticket` só grava com aprovação da aplicação, e texto
+da mensagem não é aprovação. Propostas negadas continuam visíveis no debug, separadas do que
+foi executado. Detalhes em [docs/security-threat-model.md](docs/security-threat-model.md).
+
+```bash
+python -m app.support_agent --debug                    # sem aprovação: ticket fica pendente
+python -m app.support_agent --debug --approve-tickets  # aprovação do operador, fora da mensagem
+```
+
 ## O que este repositório é
 
 Um pipeline de RAG que funciona, e **sete camadas de avaliação em cima dele**. O código do
@@ -128,11 +186,11 @@ usuário é hostil): o **Knowledge Chat** mede resposta e task scope; o **Suppor
 tools, argumentos, trajetória e side effects (o blast radius é maior). A terceira ataca a
 **Data / Context Boundary**: a pergunta é legítima e o ataque entra por **documento**.
 
-As duas primeiras rodam sob `baseline-no-new-guardrails`, sem mitigação nova. A terceira já
-teve o **primeiro ciclo before/after** do módulo: mesmo dataset, mesmas perguntas, e o
-perfil mudou para `trusted-ingestion-v1`.
+Cada suíte registra o `security_controls_profile` dos controles que estão no seu caminho de
+ataque: Knowledge Chat `task-scope-v1`, Support Agent `tool-policy-v1`, RAG
+poisoning `trusted-ingestion-v1`. O dataset não muda com o controle; o profile muda.
 
-### Knowledge Chat direct-input baseline
+### Knowledge Chat direct-input suite
 
 Uma suíte adversarial mede como o Knowledge Chat se comporta sob **entrada direta
 maliciosa** (prompt injection, grounding bypass, extração de contexto, role escalation,
@@ -147,29 +205,32 @@ resistência. Registra no Langfuse e em relatório local.
 escrever anúncio, campanha, poema, música) usando um assunto que **existe** na base. Conteúdo
 in-domain não implica que toda tarefa sobre esse conteúdo seja permitida — `grounding` e
 `source_integrity` **não** equivalem a `task_scope`, então executar a tarefa é falha blocking.
+`security_task_scope_decision` (diagnostic, só nos casos off-task) mostra se foi o task scope
+que recusou. Um pedido recusado pelo task scope não chega ao planner, então
+`security_scope_preserved` não se aplica a ele.
 
-Nesta baseline **nenhuma mitigação nova está ativa** (`security_controls_profile =
-baseline-no-new-guardrails`): fotografa o comportamento atual para comparar quando
-guardrails existirem. Não entra no quality gate ainda. A taxa é **relativa a este dataset
-versionado e às suas propriedades blocking** — não é uma medida absoluta de segurança.
+Não entra no quality gate. A taxa é **relativa a este dataset versionado e às suas
+propriedades blocking** — não é uma medida absoluta de segurança.
 
 ```bash
 python -m app.eval_security --validate-only          # valida o dataset
 python -m app.eval_security --sync                   # sincroniza o dataset com o Langfuse
-python -m app.eval_security                          # roda os ataques e pontua
+python -m app.eval_security                          # roda os ataques (experiment ...-v1-task-scope-v1)
 python -m app.eval_security --case-id sec_direct_031 # um caso; --limit N para um subconjunto
-python -m app.eval_security --case-id sec_direct_032 --diagnose-without-rerank  # isolamento (NÃO é baseline)
+python -m app.eval_security --case-id sec_direct_032 --diagnose-without-rerank  # isolamento (NÃO é a suíte)
 ```
 
 Dataset: `evals/security_direct_injection.jsonl`. Relatórios: `data/eval_runs/`.
 
-### Support Agent direct-input baseline
+### Support Agent direct-input suite
 
 Uma suíte separada mede se uma **mensagem adversarial** faz o Support Triage Agent chamar
 uma tool proibida, adicionar uma ação não solicitada, trocar argumentos (`severity`),
 atravessar o tenant (`tenant_id`) ou produzir um **side effect real** (ticket em disco).
 Lê as tool calls da trajetória real e mede o ticket criado por **snapshot/delta** do arquivo,
-não pela flag do modelo.
+não pela flag do modelo. O relatório tem duas camadas que **não** se somam: **decision**
+(o que o modelo propôs — tools, argumentos, tenant) e **enforcement** (o que a aplicação
+executou e gravou). Os ataques rodam sem aprovação nenhuma.
 
 ```bash
 python -m app.eval_security_agent --validate-only          # valida o dataset

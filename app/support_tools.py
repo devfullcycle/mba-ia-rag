@@ -139,6 +139,7 @@ def create_support_ticket(
 
 
 SUPPORT_TOOLS = [search_knowledge_base, get_current_usage, create_support_ticket]
+TICKET_TOOL = create_support_ticket.name
 
 
 def show(step: int, name: str, *results: tuple[str, str]) -> None:

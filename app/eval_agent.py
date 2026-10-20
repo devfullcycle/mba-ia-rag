@@ -23,6 +23,7 @@ from app.eval_agent_dataset import DATASET_NAME
 from app.eval_dataset import DatasetError, connect_langfuse, item_field, select_items
 from app.eval_runner import EvalRunError, average, ensure_within_policy, save_report
 from app.support_agent import run_support_agent
+from app.tool_policy import AgentExecutionContext
 from app.support_tools import TICKETS_PATH
 
 DEFAULT_EXPERIMENT = "fcai-support-triage-agent-baseline"
@@ -51,7 +52,14 @@ class AgentEvalError(Exception):
 def agent_target(*, item, **kwargs) -> dict:
     case_id = item_field(item, "id")
     print(f"  {case_id}", flush=True)
-    run = run_support_agent(item_field(item, "input")["message"], include_debug=True)
+    # Approval comes from the evaluation, outside the message: "in this case, the ticket
+    # the user asked for is authorized". Every other case runs with production's default.
+    approved = {TICKET_TOOL} if item_field(item, "expected_output")["should_create_ticket"] else set()
+    run = run_support_agent(
+        item_field(item, "input")["message"],
+        include_debug=True,
+        context=AgentExecutionContext(approved_actions=frozenset(approved)),
+    )
     result = run.result
     return {
         "answer": result.answer,

@@ -50,6 +50,7 @@ TRACES_PATH = "/v1/traces"
 
 # Span names: one per pipeline step.
 PIPELINE_SPAN = "ai.rag.pipeline"
+TASK_SCOPE_SPAN = "ai.rag.task_scope"
 QUERY_PLANNING_SPAN = "ai.rag.query_planning"
 RETRIEVAL_SPAN = "ai.rag.retrieval"
 RERANKING_SPAN = "ai.rag.reranking"
@@ -74,6 +75,11 @@ SELECTED_CHUNKS_COUNT = "app.selected_chunks_count"
 TOTAL_TOKENS = "app.total_tokens"
 
 # Governance: what the policy decided and what the run is estimated to cost.
+TASK_SCOPE_POLICY = "app.task_scope.policy"
+TASK_SCOPE_OUTCOME = "app.task_scope.outcome"
+TASK_SCOPE_ALLOWED = "app.task_scope.allowed"
+TASK_SCOPE_CATEGORY = "app.task_scope.category"
+TASK_SCOPE_ERROR_TYPE = "app.task_scope.error_type"
 POLICY_ALLOWED = "app.policy.allowed"
 POLICY_REASON = "app.policy.reason"
 MONTHLY_BUDGET_USD = "app.budget.monthly_usd"

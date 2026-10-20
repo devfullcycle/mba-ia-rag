@@ -35,8 +35,8 @@ diferentes. O terceiro **não passa pelo usuário**: nasce num documento e entra
 ingestão.
 
 ```
-User     → Knowledge Chat → Response
-User     → Support Agent  → Tool → Side effect
+User     → Task Scope Policy → Knowledge Chat → Response
+User     → Support Agent  → Tool proposal → Tool Policy → Tool → Side effect
 Document → Provenance / Ingestion → Retrieval → Model → Response
 ```
 
@@ -45,6 +45,8 @@ flowchart TB
     User([User]):::untrusted
     Input{{"[1] Input Boundary"}}:::trusted
 
+    Scope{"Task Scope Policy"}:::control
+    Refusal([Safe refusal]):::reject
     KC[Knowledge Chat]:::trusted
     Planner[Query Planner]:::trusted
     LLM[Answer model]:::model
@@ -53,6 +55,8 @@ flowchart TB
     Agent[Support Agent]:::trusted
     Decision[Model decision]:::model
     Sel[Tool selection]:::model
+    TPol{"Tool Policy<br/>tenant + approval"}:::control
+    Denied([Not executed]):::reject
     Tool[Tool]:::action
     Effect[(Side effect)]:::action
 
@@ -64,7 +68,9 @@ flowchart TB
     Reject([Rejected]):::reject
 
     User --> Input
-    Input --> KC
+    Input --> Scope
+    Scope -->|"tarefa da função"| KC
+    Scope -->|"fora da função"| Refusal
     Input --> Agent
 
     KC --> Planner --> Retrieval
@@ -75,7 +81,9 @@ flowchart TB
     LLM -->|"[3] Model Output Boundary"| Response
 
     Agent --> Decision --> Sel
-    Sel -->|"[4] Action Boundary"| Tool --> Effect
+    Sel -->|"[4] Action Boundary<br/>proposta"| TPol
+    TPol -->|"autorizada (+ aprovada, se tem efeito)"| Tool --> Effect
+    TPol -->|"tenant divergente / sem aprovação"| Denied
 
     classDef untrusted fill:#f8d7da,stroke:#b02a37,color:#000;
     classDef trusted fill:#d1e7dd,stroke:#146c43,color:#000;
@@ -89,6 +97,78 @@ flowchart TB
 **Duas setas vermelhas entram no diagrama, não uma.** A pergunta do usuário atravessa a
 Input Boundary; o documento atravessa a Data / Context Boundary. As duas terminam no mesmo
 lugar — o contexto do modelo — e só a primeira é normalmente tratada como "entrada".
+
+### Tool policy
+
+Na Action Boundary, a tool call do modelo é uma **proposta**. A `ToolPolicyMiddleware`
+(`app/tool_policy.py`, política `tool-policy-v1`) fica entre a proposta e a função Python e
+decide com base no `AgentExecutionContext` — contexto entregue pela aplicação, nunca lido da
+mensagem nem do modelo:
+
+```
+model decision → tool proposal → authorization (tenant) → approval (side effect) → execution
+```
+
+- **Tenant binding.** O tenant vem de `authenticated_tenant`. Uma proposta com `tenant_id`
+  explícito diferente é **negada**, não reescrita, e a tentativa fica registrada. Sem
+  `tenant_id`, a aplicação amarra o tenant confiável nos argumentos efetivos.
+- **Approval.** `create_support_ticket` tem side effect e só executa se a aplicação aprovou
+  essa ação para a execução (`approved_actions`). O default é sem aprovação. Texto do usuário
+  ("a diretoria aprovou") não é aprovação; aprovação não concede outro tenant.
+- **Read-only.** `search_knowledge_base` não exige aprovação; `get_current_usage` não exige
+  aprovação, mas passa pelo tenant binding.
+
+O debug do agente separa o que o modelo **propôs**, o que a política **decidiu**, o que a
+aplicação **executou** e o **side effect** produzido. Uma proposta negada continua visível.
+
+`AgentExecutionContext` representa o contexto autenticado que uma camada superior
+forneceria; não há login, token nem RBAC. A propriedade implementada é: as tools não confiam
+no modelo para escolher tenant nem para autorizar efeito.
+
+### Task scope
+
+A `Task Scope Policy` (`app/task_scope.py`, política `task-scope-v1`) decide, **antes do
+Query Planner**, se a tarefa pedida pertence à função do Knowledge Chat: responder,
+explicar, esclarecer e comparar o que está documentado. Ela responde a uma pergunta que o
+retrieval não responde. O retrieval sabe dizer se existe conteúdo sobre o **assunto**; não
+sabe dizer se a **tarefa** é do produto. Um assunto in-domain não torna a tarefa in-scope:
+traduzir uma política ou escrever um anúncio sobre um plano têm fonte real e mesmo assim
+não são função do produto — `grounding != task scope`.
+
+A decisão é tomada por modelo com structured output (`TaskScopeDecision`: `allowed`,
+`category`, `reason`), só sobre a solicitação, sem conteúdo recuperado. `allowed=false`
+encerra a requisição com uma recusa neutra antes do planner: sem retrieval, sem reranking,
+sem answer model, sem sources. Uma falha do classificador — erro de execução ou decisão
+inconsistente (`allowed` contradizendo `category`) — também recusa, e o debug a registra
+como `classifier_error`, separada de `out_of_scope`. A chamada passa pela mesma governança
+do pipeline: modelo da allowlist, budget checado antes, tokens no ledger.
+
+O Support Agent alcança o mesmo `RagPipeline` pela tool `search_knowledge_base`, então a
+política também se aplica à pergunta que o agente envia à tool; ela não se aplica à
+decisão do agente nem às outras tools.
+
+### Caller access
+
+A Data / Context Boundary tem duas decisões independentes:
+
+| Decisão | Pergunta | Onde |
+| --- | --- | --- |
+| **Source provenance** | Esta source pode **fornecer** conhecimento? | `app/provenance.py`, na ingestão |
+| **Caller access policy** | Este caller pode **receber** este conhecimento? | `app/access.py` + `build_filters`, antes do retrieval |
+
+Um documento pode ter origem confiável e ainda assim não poder ser entregue a um caller:
+`trusted source != authorized disclosure`, e `grounding != authorization`.
+
+O `RequestAccessContext` é fornecido pela aplicação e define `allowed_visibilities`.
+`build_filters` combina `SAFE_FILTERS`, esse escopo (`visibility $in allowed`) e os filtros
+restritivos do planner. O schema do planner não tem campo de visibility, a pergunta não muda o
+contexto, e o rótulo do documento descreve o conteúdo — quem decide se o caller pode vê-lo é o
+contexto. Um documento fora do escopo não é recuperado, então nunca chega ao modelo; sem
+contexto autorizado, a resposta é o no-answer de sempre, sem fontes.
+
+O caller atual do Knowledge Chat tem `{public, internal}`; documentos `restricted` ficam fora
+do escopo dele. `RequestAccessContext` representa o resultado que uma camada de
+autenticação/autorização forneceria; não há login, token nem RBAC.
 
 ### Source provenance
 
@@ -177,7 +257,7 @@ Quatro distinções usadas como vocabulário:
 | Boundary | Exemplo no projeto | Pergunta de segurança |
 | --- | --- | --- |
 | Input Boundary | User → Knowledge Chat / Support Agent | Uma entrada não confiável consegue alterar tarefa, decisão ou escopo? |
-| Data / Context Boundary | documentos / pgvector → LLM | O conteúdo fornecido ao modelo vem de uma origem autorizada, e pode ser tratado com o nível de confiança adequado? |
+| Data / Context Boundary | documentos / pgvector → LLM | O conteúdo fornecido ao modelo vem de uma origem autorizada (provenance), e este caller pode recebê-lo (access)? |
 | Model Output Boundary | LLM → aplicação | A aplicação está tratando output do modelo como dado não confiável? |
 | Action Boundary | decisão do agente → execução da tool | Uma decisão do modelo é suficiente para autorizar uma ação? |
 
@@ -208,13 +288,15 @@ flowchart TB
         API["FastAPI POST /chat<br/>app/api.py"]:::trusted
         GOV["Governance policy check<br/>app/governance.py"]:::trusted
         PIPE["RagPipeline.run<br/>app/rag_pipeline.py"]:::trusted
-        FILT["build_filters + SAFE_FILTERS<br/>app/query_planner.py"]:::trusted
+        FILT["build_filters + SAFE_FILTERS<br/>+ visibility do RequestAccessContext<br/>app/query_planner.py"]:::trusted
         SRC["build_sources<br/>(ids reais → metadata)"]:::trusted
         AG["Support Agent loop<br/>app/support_agent.py"]:::trusted
         SEL["Tool selection<br/>(schemas Pydantic)"]:::trusted
+        TPOL{"ToolPolicyMiddleware<br/>app/tool_policy.py"}:::control
     end
 
     subgraph MODELZONE[Model boundary]
+        TS["Task scope classifier<br/>(TaskScopeDecision)<br/>app/task_scope.py"]:::model
         PLAN["Query Planner<br/>(structured output)"]:::model
         RER["Reranker<br/>(structured output)"]:::model
         ANS["Answer Model<br/>(has_answer, used_chunk_ids)"]:::model
@@ -253,7 +335,9 @@ flowchart TB
     API --> GOV
     GOV -->|allowed| PIPE
     GOV -->|blocked| API
-    PIPE --> PLAN
+    PIPE --> TS
+    TS -->|"allowed"| PLAN
+    TS -->|"out_of_scope / classifier_error → recusa"| API
     PLAN -->|"QueryPlan (doc_types, plan)"| FILT
     FILT -->|"filtered similarity search"| PG
     PG -->|"retrieved chunks"| RER
@@ -270,9 +354,10 @@ flowchart TB
 
     User -->|"message (untrusted)"| AG
     AG --> AGDEC --> SEL
-    SEL -->|search_knowledge_base| PIPE
-    SEL -->|get_current_usage| USE
-    SEL -->|"create_support_ticket (side effect)"| TCK
+    SEL -->|"tool proposal"| TPOL
+    TPOL -->|search_knowledge_base| PIPE
+    TPOL -->|"get_current_usage (tenant do contexto)"| USE
+    TPOL -->|"create_support_ticket (tenant + aprovação)"| TCK
     AG -.->|"chat calls"| OAI
 
     PIPE -.->|"safe attributes"| OTEL
@@ -314,7 +399,7 @@ Cada asset é algo que, se lido, alterado ou forjado por quem não deveria, caus
 
 | Asset | Por que importa |
 | --- | --- |
-| **User input** (`question`, `message`) | Entrada não confiável; alcança planner, reranker, answer e a decisão do agente. É o vetor de prompt injection direto e de manipulação do planner. |
+| **User input** (`question`, `message`) | Entrada não confiável; alcança o classificador de task scope, planner, reranker, answer e a decisão do agente. É o vetor de prompt injection direto e de manipulação do planner. |
 | **System prompts e instruções internas** | Definem o comportamento esperado do planner, reranker, answerer e agente. O segredo deles **não** é o controle: um prompt vazado não deve derrubar a segurança. |
 | **Documentos da knowledge base** | Fonte de toda resposta do Knowledge Chat. Seu conteúdo entra no contexto do modelo; texto malicioso ali é injeção indireta. |
 | **Document metadata** (`tenant`, `product`, `status`, `plan`, `doc_type`, `visibility`, `version`) | **Fornecida pelo documento.** Governa o que o retrieval devolve. Quem escreve o documento escreve esses rótulos, então eles descrevem o conteúdo — nunca provam autorização. |
@@ -349,11 +434,13 @@ controles existentes e o risco residual.
 - **Atravessa:** o texto da pergunta, embutido no prompt do planner.
 - **Controla os dados:** o usuário.
 - **Confiança esperada:** nenhuma — é entrada não confiável dentro de um prompt.
-- **Controles atuais:** o planner só produz um `QueryPlan` tipado (`doc_types`, `plan`,
+- **Controles atuais:** antes do planner, a task scope policy recusa tarefas fora da função
+  do produto, e uma recusa nunca chega ao planner. O planner só produz um `QueryPlan` tipado (`doc_types`, `plan`,
   `exact_terms`, flags). O schema **não** contém `tenant`/`product`/`status`, então o modelo
   não consegue emitir esses filtros. `doc_types`/`plan` só **estreitam** dentro do escopo
   fixo de `SAFE_FILTERS`.
-- **Risco residual:** o usuário pode direcionar `doc_types`/`plan` para forçar ou suprimir um
+- **Risco residual:** a task scope policy é uma decisão de modelo sobre texto do próprio
+  usuário: pode ser contornada ou atacada. O usuário pode direcionar `doc_types`/`plan` para forçar ou suprimir um
   tipo de documento, ou tentar sequestrar o objetivo do planner. Não amplia escopo além de
   `SAFE_FILTERS`, mas influencia o que é recuperado.
 
@@ -394,7 +481,9 @@ controles existentes e o risco residual.
 - **Confiança esperada:** os chunks são **dados**, mas chegam ao modelo como texto — a
   fronteira dado/instrução é porosa por natureza no LLM.
 - **Controles atuais:** só chunks de origem autorizada existem no índice; `SAFE_FILTERS` fixa
-  `tenant`/`product`/`status=published`; `build_filters` sempre parte de `SAFE_FILTERS`;
+  `tenant`/`product`/`status=published`; `build_filters` sempre parte de `SAFE_FILTERS` e
+  acrescenta a visibility permitida pelo `RequestAccessContext` do caller, então documento fora
+  do escopo do caller não é recuperado;
   system prompt manda usar "ONLY the context" e citar `chunk_id`; `used_chunk_ids` é validado
   contra os ids realmente presentes.
 - **Risco residual:** um chunk de origem autorizada com instruções é lido pelo modelo como
@@ -426,12 +515,14 @@ controles existentes e o risco residual.
 - **Atravessa:** o nome da tool escolhida e seus argumentos.
 - **Controla os dados:** o modelo (decisão + argumentos).
 - **Confiança esperada:** baixa — é uma decisão do modelo virando ação.
-- **Controles atuais:** schema das tools (`@tool` + type hints); `severity` é
-  `Literal["P1","P2","P3"]` (Pydantic rejeita valor fora do enum antes da função); `summary`
-  vazio volta como erro-dado; tools retornam erro como dado, não exceção.
-- **Risco residual:** não há camada externa de autorização nem aprovação humana entre a
-  decisão e a execução. Uma escolha errada executa direto: `create_support_ticket` escreve em
-  disco sem checagem além do schema, e `tenant_id` é um argumento livre do modelo.
+- **Controles atuais:** a tool policy decide cada proposta antes da execução: `tenant_id`
+  divergente do `AgentExecutionContext` é negado, omitido é amarrado ao tenant confiável, e
+  `create_support_ticket` exige aprovação da aplicação. Uma negação volta ao modelo como
+  erro-dado e a tool não roda. Abaixo dela, o schema das tools (`severity` como `Literal`,
+  `summary` não vazio) valida a forma.
+- **Risco residual:** o modelo continua escolhendo e propondo — uma proposta errada dentro do
+  tenant e sem efeito (uma leitura, uma busca) executa. A aprovação é por ação e por execução,
+  definida pela aplicação; não há UI humana nem aprovação por argumento.
 
 ### 9. Tool Output → Agent Context
 - **Atravessa:** o retorno das tools (JSON de usage, resultado da criação de ticket, saída do
@@ -441,7 +532,7 @@ controles existentes e o risco residual.
 - **Confiança esperada:** mista: dados locais são confiáveis quanto à origem; a saída do RAG
   carrega conteúdo de documento.
 - **Controles atuais:** `search_knowledge_base` devolve só `answer` + fontes, sem
-  prompts/chunks/debug. `get_current_usage` valida `tenant_id` e recusa desconhecido.
+  prompts/chunks/debug. `get_current_usage` só recebe o tenant que a tool policy amarrou.
 - **Risco residual:** conteúdo de documento pode retornar pelo RAG e reentrar no contexto do
   agente (context poisoning encadeado), influenciando a próxima decisão de tool.
 
@@ -537,6 +628,38 @@ garante.
   *Limit:* responde "esta origem está autorizada?", não "este conteúdo é seguro?". Não há
   assinatura, aprovação humana nem revisão; quem escreve dentro de uma source autorizada é
   confiável por construção.
+- **Generic input guardrails — opcional, desligado por padrão** (`app/input_guardrails.py`,
+  `config/openai_guardrails.json`)
+  *Control:* quando `OPENAI_GUARDRAILS_ENABLED=true`, os checks Jailbreak e Custom Prompt
+  Check do pacote `openai-guardrails` rodam sobre a pergunta antes das políticas da aplicação;
+  um tripwire, ou uma falha de execução do check, encerra a requisição antes do RAG
+  (fail-secure). Os tokens entram no ledger.
+  *Limit:* detector probabilístico sobre o texto, com falsos positivos e falsos negativos; não
+  substitui autorização, provenance, tool policy nem controle de acesso, que dependem de fatos
+  que o detector não conhece (tenant, origem, aprovação, visibility); dependência de um
+  provedor externo e de um pacote em preview; acrescenta latência e custo a toda requisição.
+- **Task scope policy** (`app/task_scope.py`, `app/rag_pipeline.py`)
+  *Control:* classifica se a tarefa solicitada pertence à função do Knowledge Chat antes do
+  RAG; `allowed=false` encerra antes do planner, sem retrieval, sem answer model e sem
+  sources. Falha do classificador recusa (fail-safe) e é registrada separada da decisão
+  `out_of_scope`. A decisão (`outcome`, `category`) vai para debug, run log e spans; o prompt
+  e o `reason` não vão para os spans. Reduz o caminho de off-task generation (task
+  hijacking com assunto do domínio).
+  *Limit:* é uma decisão probabilística baseada em modelo — pode produzir falsos positivos e
+  falsos negativos, e o próprio classificador pode ser atacado. Structured output garante a
+  forma da decisão, não o acerto. Não elimina prompt injection, não protege o contexto
+  recuperado (indirect injection, SEC-002), não autoriza nem restringe tools e não protege a
+  decisão do Support Agent.
+- **Visibility-aware retrieval / `RequestAccessContext`** (`app/access.py`, `app/query_planner.py`)
+  *Control:* um contexto de acesso controlado pela aplicação restringe quais visibilities de
+  documento participam do retrieval (`visibility $in allowed_visibilities`), antes de qualquer
+  chunk chegar ao modelo. O planner não tem campo para alterar esse escopo e a pergunta não o
+  altera.
+  *Limit:* a identidade real ainda é fornecida por uma camada externa simulada; o rótulo
+  `visibility` precisa estar classificado corretamente — um documento mal classificado é
+  entregue a quem não deveria; um caller autorizado ainda pode receber conteúdo incorreto ou
+  malicioso; não substitui provenance; não protege contra indirect prompt injection em
+  conteúdo autorizado.
 - **`SAFE_FILTERS` no retrieval** (`app/query_planner.py`)
   *Control:* `build_filters` sempre parte de `{"tenant":"fcai","product":"fcai-cloud",
   "status":"published"}`; o modelo só acrescenta `doc_type`/`plan`, que **estreitam**.
@@ -547,10 +670,20 @@ garante.
   *Limit:* `status` é declarado no front matter; quem escreve o documento escolhe o próprio
   rótulo. Não é um controle de confiança — a decisão de origem é que trata procedência.
 - **Structured output com Pydantic**
-  *Control:* `QueryPlan`, `RerankResult`, `RagAnswer`, `SupportAgentResult` garantem a forma
+  *Control:* `TaskScopeDecision`, `QueryPlan`, `RerankResult`, `RagAnswer`, `SupportAgentResult` garantem a forma
   da saída do modelo.
   *Limit:* valida **tipo**, não verdade nem autorização. Um `has_answer=true` bem-formado
   ainda pode estar errado.
+- **Tool execution policy** (`app/tool_policy.py`, `app/support_agent.py`)
+  *Control:* valida cada tool call fora do modelo, antes da execução. O tenant vem do
+  `AgentExecutionContext`; `tenant_id` explícito divergente é negado sem ser reescrito;
+  ação com side effect (`create_support_ticket`) exige aprovação controlada pela aplicação,
+  e aprovação não substitui a autorização de tenant. Proposta, decisão, execução e side effect
+  são registrados separadamente.
+  *Limit:* o modelo ainda pode propor a ação errada; identidade autenticada real não existe —
+  o contexto é fornecido pela aplicação; o mecanismo de aprovação é didático, no nível da
+  aplicação; a política não protege prompt nem contexto e não impede negação de serviço nem
+  custo de modelo.
 - **Validação de parâmetros das tools** (`app/support_tools.py`)
   *Control:* `severity` é enum via `Literal`; `summary` vazio volta como erro-dado; erros são
   dados, não exceções.
@@ -606,14 +739,17 @@ do Support Agent — sobrepondo instruções, trocando a tarefa ou influenciando
 influenciada por texto.
 **Likelihood:** high · **Impact:** medium (Knowledge Chat) / high (Support Agent, pelo blast
 radius maior).
-**Current controls:** system instructions; structured outputs; escopo de retrieval fixo
-(`SAFE_FILTERS`); tool schemas.
-**Observed behavior:** o Knowledge Chat apresenta task hijacking / off-task generation —
-executa tarefas fora da finalidade quando o assunto está dentro do domínio. O Support Agent
-apresenta goal hijacking e manipulação de tool.
-**Residual risk:** instruções de prompt não constituem security boundary. `grounding` e
-`source_integrity` não equivalem a `task_scope`: uma fonte real sustenta os fatos, não
-autoriza a tarefa.
+**Current controls:** task scope policy (`task-scope-v1`) antes do planner do Knowledge Chat;
+system instructions; structured outputs; escopo de retrieval fixo (`SAFE_FILTERS`); tool
+schemas.
+**Observed behavior:** no Knowledge Chat, `task-scope-v1` mitiga o caminho de off-task
+generation observado — tarefas fora da finalidade com assunto do domínio são recusadas antes
+do RAG. O Support Agent apresenta goal hijacking e manipulação de tool.
+**Residual risk:** instruções de prompt não constituem security boundary, e a task scope
+policy também é uma decisão de modelo: reduz off-task generation, mas não elimina prompt
+injection, pode errar nos dois sentidos e pode ser atacada. Não cobre a decisão do Support
+Agent nem injeção indireta. `grounding` e `source_integrity` não equivalem a `task_scope`:
+uma fonte real sustenta os fatos, não autoriza a tarefa.
 **Status:** open · **OWASP:** LLM01, ASI01
 
 ### SEC-002 — Indirect prompt injection via RAG
@@ -666,12 +802,15 @@ tools.
 **Impact:** não existe mecanismo que **imponha** isolamento; ao surgir um segundo tenant, ou
 com `tenant_id` controlável, não há autorização protegendo os dados.
 **Likelihood:** medium · **Impact:** high
-**Current controls:** `SAFE_FILTERS` fixa o escopo de retrieval; `get_current_usage` recusa
-tenant desconhecido.
-**Observed behavior:** o agente já emitiu tool calls cross-tenant a partir de entrada
-adversarial.
-**Residual risk:** filtro de metadata não é autenticação; argumentos de tool não estão
-amarrados a nenhuma identidade.
+**Current controls:** `SAFE_FILTERS` fixa o escopo de retrieval; o `RequestAccessContext`
+restringe as visibilities que o caller recebe; na Action Boundary, a tool
+policy amarra `tenant_id` ao `authenticated_tenant` do `AgentExecutionContext` e nega
+proposta com tenant divergente antes da tool.
+**Observed behavior:** o agente propõe tool calls cross-tenant a partir de entrada
+adversarial; a tool policy impede que elas executem.
+**Residual risk:** `AgentExecutionContext` ainda representa uma identidade fornecida pela
+aplicação — autenticação real não foi implementada; filtro de metadata não é autenticação;
+`tenant` continua constante no Knowledge Chat.
 **Status:** open · **OWASP:** LLM09, LLM02, ASI03
 
 ### SEC-005 — Hidden context exposure
@@ -697,10 +836,13 @@ aparecer em conteúdo recuperado.
 classificação ou redação.
 **Impact:** vazamento de informação sensível na saída.
 **Likelihood:** medium · **Impact:** medium
-**Current controls:** escopo `status=published`; usage acessível só via tool dedicada com
-validação de tenant.
-**Residual risk:** não há classificação nem redação de dado sensível na saída; nada impede que
-um documento autorizado contenha PII.
+**Current controls:** escopo `status=published`; visibility-aware retrieval — documento com
+visibility fora do `RequestAccessContext` do caller não é recuperado nem entregue ao modelo;
+usage acessível só via tool dedicada com tenant amarrado ao contexto.
+**Residual risk:** o controle depende da classificação correta do documento: dado sensível num
+documento rotulado com visibility ampla é entregue normalmente. Não há classificação nem
+redação de dado sensível dentro de um documento autorizado, e a identidade do caller ainda não
+é autenticada.
 **Status:** open · **OWASP:** LLM02
 
 ### SEC-007 — Improper output handling
@@ -718,16 +860,20 @@ de texto é livre.
 ### SEC-008 — Tool authorization
 
 **Component:** `Agent decision → Tool execution` (fronteira 8).
-**Threat:** o agente escolhe e executa uma tool sem nenhuma camada de autorização entre a
+**Threat:** o agente executa uma tool só porque o modelo a escolheu, sem autorização entre a
 decisão e a execução.
 **Impact:** ação executada apenas porque o modelo a escolheu, incluindo escrita em disco.
 **Likelihood:** medium · **Impact:** high
-**Current controls:** schemas de tool; validação de argumentos; erro como dado.
-**Observed behavior:** entrada adversarial já provocou tool calls não solicitadas, com side
-effect persistido.
-**Residual risk:** não há política nem allowlist de execução por contexto; a decisão do modelo
-é, na prática, a autorização.
-**Status:** open · **OWASP:** ASI02, ASI03, LLM03
+**Current controls:** tool execution policy (`tool-policy-v1`) entre proposta e execução:
+allowlist das três tools, tenant binding e aprovação para side effect; schemas de tool;
+validação de argumentos; erro como dado.
+**Observed behavior:** entrada adversarial ainda leva o modelo a propor tool calls não
+solicitadas; as que exigem aprovação ou atravessam tenant não executam.
+**Residual risk:** cobre só as três tools atuais — uma tool nova precisa declarar sua classe
+(read-only, tenant-scoped, side effect) na política. Propostas read-only no tenant correto
+executam mesmo quando a tarefa não as exigia.
+**Status:** mitigated — apenas para as tools cobertas pela política atual · **OWASP:** ASI02,
+ASI03, LLM03
 
 ### SEC-009 — Excessive agency do Support Agent
 
@@ -737,26 +883,31 @@ tarefa não exige.
 **Impact:** efeitos colaterais indesejados e consumo extra; blast radius maior que o da tarefa
 pedida.
 **Likelihood:** medium · **Impact:** medium
-**Current controls:** system prompt limita quando agir; avaliação determinística de trajetória
-e de tools proibidas, offline.
-**Observed behavior:** entrada adversarial já levou o agente a executar ações além da tarefa
-legítima, com side effect persistido.
-**Residual risk:** não existe limite forçado fora do prompt — nem confirmação, nem teto de
-passos em runtime.
+**Current controls:** system prompt limita quando agir; a tool policy impede que propostas
+com side effect executem sem aprovação e que atravessem o tenant; avaliação determinística de
+trajetória e de tools proibidas, offline.
+**Observed behavior:** entrada adversarial leva o agente a propor ações além da tarefa
+legítima; o efeito dessas propostas é contido pela tool policy.
+**Residual risk:** o modelo continua com a capacidade de propor ações e de escolher leituras
+desnecessárias; não há teto de passos em runtime.
 **Status:** open · **OWASP:** LLM03, ASI01
 
 ### SEC-010 — Approval boundary para ações sensíveis
 
 **Component:** `create_support_ticket` (efeito real em `data/support_tickets.jsonl`).
 **Threat:** uma ação que muda o mundo é executada direto da decisão do modelo, sem aprovação
-humana nem etapa de confirmação.
-**Impact:** escrita persistida sem gate humano; difícil de reverter num cenário real.
+nem etapa de confirmação.
+**Impact:** escrita persistida sem gate; difícil de reverter num cenário real.
 **Likelihood:** medium · **Impact:** high
-**Current controls:** validação de argumentos; a tool só é chamada quando o modelo decide.
-**Observed behavior:** entrada adversarial já produziu tickets persistidos com argumentos
-manipulados, sem nenhuma etapa de aprovação.
-**Residual risk:** não há human-in-the-loop nem confirmação para ações com efeito.
-**Status:** open · **OWASP:** ASI02, LLM03
+**Current controls:** `create_support_ticket` exige aprovação controlada pela aplicação
+(`approved_actions` no `AgentExecutionContext`, default vazio). Sem aprovação, a proposta é
+registrada e nenhum ticket é persistido; texto da mensagem não conta como aprovação.
+**Observed behavior:** entrada adversarial leva o modelo a propor tickets, inclusive com
+severity manipulada; a proposta fica visível e não vira side effect.
+**Residual risk:** a aprovação é por tool e por execução, não por argumento — uma aprovação
+dada para um ticket legítimo vale para o ticket que o modelo propuser naquela execução. Não há
+UI humana. Ações sensíveis futuras precisam declarar a própria exigência de aprovação.
+**Status:** mitigated — apenas para `create_support_ticket` · **OWASP:** ASI02, LLM03
 
 ### SEC-011 — Observability e cópias secundárias de dados
 
@@ -818,6 +969,7 @@ flowchart LR
     DOC([Documento]):::untrusted
 
     subgraph KC[Knowledge Chat path]
+        TSC{"task scope policy<br/>(task-scope-v1)"}:::model
         KCAPP["FastAPI + RagPipeline"]:::trusted
         KCM["planner / reranker / answer"]:::model
         RESP([Response]):::trusted
@@ -826,13 +978,15 @@ flowchart LR
     subgraph AG[Support Agent path]
         AGAPP["Support Agent"]:::trusted
         AGM["model decision / tool selection"]:::model
+        TP{"tool policy<br/>(tool-policy-v1)"}:::trusted
         TOOL["create_support_ticket<br/>(real side effect)"]:::action
     end
 
     ING["Ingestion + chunking"]:::trusted
     VS[("pgvector + data/*")]:::data
 
-    U -.->|"no authn / no rate limit"| KCAPP
+    U -.->|"no authn / no rate limit"| TSC
+    TSC -.->|"decisão de modelo: falso positivo / falso negativo"| KCAPP
     U -.->|"no authn / no rate limit"| AGAPP
 
     DOC -->|"source provenance (trusted-source-v1)"| ING
@@ -843,7 +997,8 @@ flowchart LR
     KCM -->|"structured output (só a forma)"| RESP
 
     AGAPP -.->|"agent loop fora de budget/allowlist"| AGM
-    AGM -.->|"no external authz / no human approval"| TOOL
+    AGM -->|"proposta"| TP
+    TP -->|"tenant do contexto + aprovação da aplicação<br/>(sem identidade autenticada)"| TOOL
     TOOL --> VS
 
     classDef untrusted fill:#f8d7da,stroke:#b02a37,color:#000;
@@ -854,18 +1009,25 @@ flowchart LR
 ```
 
 **Fronteiras impostas pela aplicação:** procedência da origem antes da indexação
-(`trusted-source-v1`, SEC-003); `SAFE_FILTERS` fixa o escopo de retrieval; structured output
-fixa a forma da saída do modelo; a governança limita modelo e budget do pipeline; a política de
-observabilidade limita o que sai em telemetria.
+(`trusted-source-v1`, SEC-003); recusa de tarefas fora da função antes do planner
+(`task-scope-v1`, SEC-001 — a recusa é imposta pela aplicação, a decisão é do modelo);
+`SAFE_FILTERS` fixa o escopo de retrieval; a tool policy decide cada proposta do agente antes
+da execução — tenant amarrado ao contexto e aprovação para side effect (`tool-policy-v1`,
+SEC-008, SEC-010); structured output fixa a forma da saída do modelo; a governança limita
+modelo e budget do pipeline; a política de observabilidade limita o que sai em telemetria.
 
 **Riscos residuais (tracejado no diagrama):**
 
 - autenticação e rate limiting na entrada (SEC-014);
+- a decisão de task scope é probabilística e não é autorização — prompt injection direto
+  continua aberto (SEC-001);
 - identidade autenticada por trás do `tenant` (SEC-004);
 - aprovação/revisão humana e autenticidade criptográfica do documento antes da indexação
   (SEC-003 residual);
 - conteúdo vindo de fonte autorizada chega ao modelo sem nenhuma imposição de confiança no
   **nível do conteúdo** — `trusted source != trusted content` (SEC-002);
-- autorização externa e aprovação humana entre a decisão do agente e a execução da ação
-  (SEC-008, SEC-010);
+- identidade autenticada por trás do `AgentExecutionContext` e aprovação humana real (hoje a
+  aprovação é da aplicação, por tool e por execução) (SEC-004, SEC-010);
+- o modelo do agente continua propondo ações manipuladas; a política contém o efeito, não a
+  decisão (SEC-009);
 - governança aplicada também ao loop do agente (SEC-014).

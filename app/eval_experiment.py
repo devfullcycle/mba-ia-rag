@@ -98,6 +98,9 @@ class VariantRunner:
             # The policy decision, as a bool. A blocked run answers with a refusal and
             # would otherwise be indistinguishable from the pipeline choosing to refuse.
             "policy_allowed": debug.policy.allowed if debug.policy else True,
+            # Same reason, one step later: a legitimate question the task scope refused
+            # would otherwise read as an ordinary quality miss.
+            "task_scope": debug.task_scope.outcome if debug.task_scope else None,
             "sources": source_files(result.sources),
             "total_ms": debug.timings.total_ms,
             "total_tokens": input_tokens + output_tokens,

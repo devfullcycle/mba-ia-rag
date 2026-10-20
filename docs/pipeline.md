@@ -11,6 +11,9 @@ O que se mede e como se compara está no [README](../README.md).
 pergunta do usuário
    │
    ▼
+0. task scope ──── tarefa fora da função do produto? → recusa neutra e para
+   │
+   ▼
 1. query planner ──── pergunta ambígua? → devolve pergunta de esclarecimento e para
    │
    ▼
@@ -28,12 +31,14 @@ answer + sources
 
 | Etapa | O que faz |
 | --- | --- |
+| **Task scope** (`app/task_scope.py`) | O modelo decide, só pela solicitação e sem conteúdo recuperado, se a **tarefa** é função do Knowledge Chat (responder, explicar, esclarecer, comparar o que está documentado). Traduzir, escrever anúncio ou poema sobre um plano é assunto do domínio e tarefa fora dele. Fora do escopo, ou falha do classificador, o fluxo para aqui com `has_answer=false` e sem sources. |
 | **Query planner** (`app/query_planner.py`) | O modelo lê a pergunta e devolve um plano estruturado: a pergunta reescrita para buscar melhor, os termos literais a preservar (P1, SSO, 99,9%), os tipos de documento que podem conter a resposta e o plano comercial em questão. Se a pergunta tem mais de uma leitura possível, ele pede esclarecimento em vez de chutar. |
 | **Retrieval** (`app/query_planner.py`) | Busca semântica no pgvector com a pergunta normalizada, filtrada pelos metadados que o plano indicou. Traz até 8 candidatos — generoso de propósito, para o reranking ter de onde escolher. |
 | **Reranking** (`app/rerank.py`) | O modelo lê os 8 candidatos e seleciona no máximo 4 que realmente ajudam a responder. Retrieval otimiza recall; reranking otimiza precisão. Se nenhum candidato serve, o fluxo para aqui, **sem chamar o modelo de resposta**. |
 | **Resposta** (`app/rag_pipeline.py`) | O modelo responde usando apenas os chunks selecionados e devolve `answer`, `has_answer` e os `used_chunk_ids` em que se baseou. |
 
-O modelo de chat é chamado em exatamente três pontos — planner, reranker e resposta. A
+O modelo de chat é chamado em exatamente quatro pontos — task scope, planner, reranker e
+resposta. Uma solicitação recusada pelo task scope paga só a primeira chamada. A
 ingestão e a indexação não chamam o modelo de chat, só o de embeddings.
 
 O pipeline inteiro vive em `app/rag_pipeline.py` e devolve um objeto de dados; quem

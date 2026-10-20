@@ -45,6 +45,10 @@ class Settings(BaseSettings):
         Path("data/ai_usage.jsonl"), alias="AI_USAGE_LEDGER_PATH"
     )
 
+    # Optional generic input guardrails (openai-guardrails), before the application's own
+    # policies. Off by default: an experiment is not a control until someone turns it on.
+    openai_guardrails_enabled: bool = Field(False, alias="OPENAI_GUARDRAILS_ENABLED")
+
     langfuse_public_key: str = Field("", alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key: str = Field("", alias="LANGFUSE_SECRET_KEY")
     langfuse_host: str = Field("http://localhost:3000", alias="LANGFUSE_HOST")

@@ -21,6 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from app import observability
+from app.access import DEFAULT_ACCESS, RequestAccessContext
 from app.config import settings
 from app.governance import (
     PolicyDecision,
@@ -48,6 +49,16 @@ from app.rerank import (
     select_reranked_documents,
 )
 from app.retrieve import connect_store, ensure_collection_ready
+from app.task_scope import (
+    OUT_OF_SCOPE,
+    OUT_OF_SCOPE_MESSAGE,
+    UNAVAILABLE_MESSAGE,
+    TaskScopeDebug,
+    TaskScopeDecision,
+    build_task_scope_prompt,
+    from_decision,
+    from_error,
+)
 
 PREVIEW_LIMIT = 300
 NO_ANSWER_MESSAGE = (
@@ -55,6 +66,7 @@ NO_ANSWER_MESSAGE = (
     "para responder com segurança."
 )
 FALLBACK_CLARIFICATION = "Pode detalhar melhor a sua pergunta?"
+INPUT_GUARDRAIL_MESSAGE = "Esta solicitação não pode ser processada."
 POLICY_BLOCKED_MESSAGE = (
     "Esta solicitação não pode ser processada porque ultrapassa uma política "
     "operacional da aplicação."
@@ -147,6 +159,8 @@ class QueryPlanDebug(QueryPlan):
 
 
 class PipelineTimings(BaseModel):
+    input_guardrails_ms: float | None = None
+    task_scope_ms: float | None = None
     query_planning_ms: float | None = None
     retrieval_ms: float | None = None
     reranking_ms: float | None = None
@@ -164,7 +178,11 @@ class ModelUsage(BaseModel):
 class RagDebug(BaseModel):
     request_id: str
     policy: PolicyDecision | None = None
-    # Absent when the policy blocked the run: the planner was never called.
+    # Absent when the governance policy blocked the run: the classifier never ran.
+    # Generic input guardrails, when enabled: flagged/confidence/tokens per check.
+    input_guardrails: list[dict] = Field(default_factory=list)
+    task_scope: TaskScopeDebug | None = None
+    # Absent when a policy blocked the run: the planner was never called.
     query_plan: QueryPlanDebug | None = None
     retrieved_chunks: list[RetrievalChunkDebug] = Field(default_factory=list)
     selected_chunk_ids: list[str] = Field(default_factory=list)
@@ -261,6 +279,19 @@ def build_usage_attributes(usage_metadata: dict) -> dict:
     }
 
 
+def guardrail_usage(outcomes: list[dict]) -> list[ModelUsage]:
+    return [
+        ModelUsage(
+            model=f"{outcome['guardrail_name']} guardrail",
+            input_tokens=outcome["prompt_tokens"] or 0,
+            output_tokens=outcome["completion_tokens"] or 0,
+            total_tokens=outcome["total_tokens"],
+        )
+        for outcome in outcomes
+        if outcome["total_tokens"]
+    ]
+
+
 def build_sources(documents: list[Document], used_chunk_ids: list[str]) -> list[Source]:
     # Sources come from the application, never from the model: only chunk ids that
     # were really in the context are kept, joined back with their own metadata.
@@ -271,6 +302,7 @@ def build_sources(documents: list[Document], used_chunk_ids: list[str]) -> list[
 
 
 class RagPipeline:
+    input_guardrails = None
     # table_name is the collection this pipeline reads from. Production never passes it;
     # a security evaluation points the same pipeline at an isolated collection instead of
     # building a second, fake RAG to attack.
@@ -292,6 +324,12 @@ class RagPipeline:
             temperature=0,
             max_tokens=policy.max_output_tokens,
         )
+        if settings.openai_guardrails_enabled:
+            # Imported only when enabled: the package is an optional experiment.
+            from app.input_guardrails import load_guardrails
+
+            self.input_guardrails = load_guardrails()
+        self.task_scope = model.with_structured_output(TaskScopeDecision)
         self.planner = model.with_structured_output(QueryPlan)
         self.reranker = model.with_structured_output(RerankResult)
         self.answerer = model.with_structured_output(RagAnswer)
@@ -315,6 +353,7 @@ class RagPipeline:
         include_debug: bool = False,
         on_prompt: PromptCallback | None = None,
         on_context: ContextCallback | None = None,
+        access: RequestAccessContext = DEFAULT_ACCESS,
     ) -> RagPipelineResult:
         request_id = str(uuid4())
         timings = PipelineTimings()
@@ -345,8 +384,22 @@ class RagPipeline:
                 )
                 observability.record_debug_content(span, question=question)
 
-                if decision.allowed:
-                    result = self._execute(
+                guardrails = self._run_input_guardrails(question, timings) if decision.allowed else []
+                if not decision.allowed:
+                    result = self._refusal(
+                        POLICY_BLOCKED_MESSAGE, RagDebug(request_id=request_id, timings=timings)
+                    )
+                elif any(o["tripwire_triggered"] or o["execution_error"] for o in guardrails):
+                    # Fail-secure: a tripwire stops the request before the RAG, and so does a
+                    # check that could not run. The application's own policies still follow
+                    # on every request that passes.
+                    errored = any(o["execution_error"] for o in guardrails)
+                    result = self._refusal(
+                        UNAVAILABLE_MESSAGE if errored else INPUT_GUARDRAIL_MESSAGE,
+                        RagDebug(request_id=request_id, timings=timings),
+                    )
+                else:
+                    result = self._run_in_scope(
                         question,
                         use_rerank,
                         request_id,
@@ -354,13 +407,15 @@ class RagPipeline:
                         config,
                         on_prompt=on_prompt,
                         on_context=on_context,
+                        access=access,
                     )
-                else:
-                    result = self._blocked(request_id, decision, timings)
 
                 result.debug.policy = decision
+                result.debug.input_guardrails = guardrails
 
-                model_usage = build_model_usage(usage.usage_metadata)
+                # The guardrail calls go through the guardrails package, not LangChain, so
+                # their tokens are added here — no model call outside the ledger.
+                model_usage = build_model_usage(usage.usage_metadata) + guardrail_usage(guardrails)
                 input_tokens, output_tokens, total_tokens = aggregate_tokens(model_usage)
                 estimated_cost_usd = estimate_cost_usd(input_tokens, output_tokens)
 
@@ -393,6 +448,7 @@ class RagPipeline:
 
         debug = result.debug
         debug.model_usage = model_usage
+        task_scope = debug.task_scope
 
         # Only a run that really called the model enters the ledger, and it is what
         # the next request will read as the month's spend.
@@ -416,6 +472,8 @@ class RagPipeline:
                 "used_rerank": use_rerank,
                 "policy_allowed": decision.allowed,
                 "policy_reason": decision.reason,
+                "task_scope_outcome": task_scope.outcome if task_scope else None,
+                "task_scope_category": task_scope.category if task_scope else None,
                 "monthly_budget_usd": decision.monthly_budget_usd,
                 "current_month_spend_usd": decision.current_month_spend_usd,
                 "estimated_cost_usd": estimated_cost_usd,
@@ -433,6 +491,81 @@ class RagPipeline:
             result.debug = None
         return result
 
+    def _run_input_guardrails(self, question: str, timings: PipelineTimings) -> list[dict]:
+        if not self.input_guardrails:
+            return []
+        from app.input_guardrails import run_checks
+
+        started = time.perf_counter()
+        outcomes = run_checks(question, self.input_guardrails)
+        timings.input_guardrails_ms = _elapsed_ms(started)
+        return [outcome.model_dump() for outcome in outcomes]
+
+    def _run_in_scope(
+        self,
+        question: str,
+        use_rerank: bool,
+        request_id: str,
+        timings: PipelineTimings,
+        config: dict,
+        *,
+        on_prompt: PromptCallback | None,
+        on_context: ContextCallback | None,
+        access: RequestAccessContext,
+    ) -> RagPipelineResult:
+        # Same model, same governance decision and the same usage callback as the rest
+        # of the run: the classifier's tokens enter the ledger.
+        task_scope = self._check_task_scope(question, timings, config, on_prompt=on_prompt)
+        if task_scope.allowed:
+            result = self._execute(
+                question,
+                use_rerank,
+                request_id,
+                timings,
+                config,
+                on_prompt=on_prompt,
+                on_context=on_context,
+                access=access,
+            )
+        else:
+            # Ends before the planner: no retrieval, no rerank, no answer model.
+            answer = (
+                OUT_OF_SCOPE_MESSAGE if task_scope.outcome == OUT_OF_SCOPE else UNAVAILABLE_MESSAGE
+            )
+            result = self._refusal(answer, RagDebug(request_id=request_id, timings=timings))
+        result.debug.task_scope = task_scope
+        return result
+
+    def _check_task_scope(
+        self,
+        question: str,
+        timings: PipelineTimings,
+        config: dict,
+        *,
+        on_prompt: PromptCallback | None,
+    ) -> TaskScopeDebug:
+        prompt = build_task_scope_prompt(question)
+        if on_prompt:
+            on_prompt("Task scope prompt", prompt)
+
+        with _step(timings, "task_scope_ms", observability.TASK_SCOPE_SPAN) as span:
+            try:
+                task_scope = from_decision(self.task_scope.invoke(prompt, config=config))
+            except Exception as exc:
+                task_scope = from_error(exc)
+            # The decision only: never the prompt, and not the model's reason either.
+            observability.set_attributes(
+                span,
+                {
+                    observability.TASK_SCOPE_POLICY: task_scope.policy,
+                    observability.TASK_SCOPE_OUTCOME: task_scope.outcome,
+                    observability.TASK_SCOPE_ALLOWED: task_scope.allowed,
+                    observability.TASK_SCOPE_CATEGORY: task_scope.category,
+                    observability.TASK_SCOPE_ERROR_TYPE: task_scope.error_type,
+                },
+            )
+        return task_scope
+
     def _execute(
         self,
         question: str,
@@ -443,6 +576,7 @@ class RagPipeline:
         *,
         on_prompt: PromptCallback | None,
         on_context: ContextCallback | None,
+        access: RequestAccessContext,
     ) -> RagPipelineResult:
         planner_prompt = build_planner_prompt(question)
         if on_prompt:
@@ -465,7 +599,7 @@ class RagPipeline:
                 },
             )
 
-        filters = build_filters(query_plan)
+        filters = build_filters(query_plan, access)
         debug = RagDebug(
             request_id=request_id,
             query_plan=build_query_plan_debug(query_plan, filters),
@@ -562,22 +696,14 @@ class RagPipeline:
             debug=debug,
         )
 
-    def _blocked(
-        self, request_id: str, decision: PolicyDecision, timings: PipelineTimings
-    ) -> RagPipelineResult:
+    def _refusal(self, answer: str, debug: RagDebug) -> RagPipelineResult:
         return RagPipelineResult(
-            answer=POLICY_BLOCKED_MESSAGE,
-            has_answer=False,
-            needs_clarification=False,
-            sources=[],
-            debug=RagDebug(request_id=request_id, policy=decision, timings=timings),
-        )
-
-    def _no_answer(self, debug: RagDebug) -> RagPipelineResult:
-        return RagPipelineResult(
-            answer=NO_ANSWER_MESSAGE,
+            answer=answer,
             has_answer=False,
             needs_clarification=False,
             sources=[],
             debug=debug,
         )
+
+    def _no_answer(self, debug: RagDebug) -> RagPipelineResult:
+        return self._refusal(NO_ANSWER_MESSAGE, debug)

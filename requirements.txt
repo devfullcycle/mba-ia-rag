@@ -21,5 +21,10 @@ ragas
 # 0.4.2. Without this, importing ragas raises ModuleNotFoundError.
 # https://github.com/vibrantlabsai/ragas/issues/2745
 langchain-community==0.4.1
+# Pinned: openai-guardrails is in preview and its API changes between releases. Its
+# dependency openai-agents would otherwise pull openai 3.x, which langchain-openai does not
+# accept (openai<3), so openai is bounded explicitly.
+openai-guardrails==0.3.3
+openai>=2.26.0,<3.0.0
 pytest
 httpx

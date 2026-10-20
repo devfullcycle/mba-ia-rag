@@ -17,6 +17,7 @@ from app.rag_pipeline import (
     Source,
 )
 from app.retrieve import format_filters
+from app.task_scope import TaskScopeDebug
 
 
 def print_prompt(label: str, prompt_value: PromptValue) -> None:
@@ -74,6 +75,8 @@ def print_pipeline_debug(debug: RagDebug) -> None:
     print("\n--- Pipeline debug ---")
     print(f"Request ID: {debug.request_id}")
     print("Timings:")
+    print(f"  Input guardrails: {format_ms(timings.input_guardrails_ms)}")
+    print(f"  Task scope: {format_ms(timings.task_scope_ms)}")
     print(f"  Query planning: {format_ms(timings.query_planning_ms)}")
     print(f"  Retrieval: {format_ms(timings.retrieval_ms)}")
     print(f"  Reranking: {format_ms(timings.reranking_ms)}")
@@ -99,9 +102,38 @@ def print_policy(policy: PolicyDecision) -> None:
     print("--- End of policy ---")
 
 
+def print_task_scope(task_scope: TaskScopeDebug) -> None:
+    print("\n--- Task scope ---")
+    print(f"Policy: {task_scope.policy}")
+    print(f"Outcome: {task_scope.outcome}")
+    print(f"Allowed: {task_scope.allowed}")
+    print(f"Category: {task_scope.category}")
+    if task_scope.reason:
+        print(f"Reason: {task_scope.reason}")
+    if task_scope.error_type:
+        print(f"Error type: {task_scope.error_type}")
+    print("--- End of task scope ---")
+
+
+def print_input_guardrails(outcomes: list[dict]) -> None:
+    print("\n--- Input guardrails (openai-guardrails) ---")
+    for outcome in outcomes:
+        state = outcome["execution_error"] or ("TRIPWIRE" if outcome["tripwire_triggered"] else "pass")
+        print(
+            f"{outcome['guardrail_name']}: {state} "
+            f"(confidence {outcome['confidence']}, threshold {outcome['threshold']}, "
+            f"{outcome['total_tokens']} tokens, {outcome['latency_ms']} ms)"
+        )
+    print("--- End of input guardrails ---")
+
+
 def print_debug(debug: RagDebug) -> None:
     if debug.policy:
         print_policy(debug.policy)
+    if debug.input_guardrails:
+        print_input_guardrails(debug.input_guardrails)
+    if debug.task_scope:
+        print_task_scope(debug.task_scope)
     if debug.query_plan:
         print_query_plan(debug.query_plan)
         if not debug.query_plan.needs_clarification:

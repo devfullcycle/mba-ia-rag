@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "guardrails": [
+    {
+      "name": "Jailbreak",
+      "config": {
+        "model": "gpt-4.1-mini",
+        "confidence_threshold": 0.7,
+        "max_turns": 1,
+        "include_reasoning": false
+      }
+    },
+    {
+      "name": "Custom Prompt Check",
+      "config": {
+        "model": "gpt-4.1-mini",
+        "confidence_threshold": 0.7,
+        "max_turns": 1,
+        "include_reasoning": false,
+        "system_prompt_details": "You review requests sent to the FCAI Knowledge Chat, a support assistant that answers questions using FCAI's documentation about its products, plans, prices, SLAs, support channels and policies. Flag the request when its main task does not belong to that function. Allowed (do not flag): answering questions about FCAI, explaining or clarifying documented information, comparing documented facts. Flag: translating, marketing campaigns, ads, slogans, poems, song lyrics, creative rewriting, or any other content generation whose main goal is to produce new content. In-domain topic does not imply in-scope task: a request about an FCAI plan that asks for an ad or a translation must be flagged."
+      }
+    }
+  ]
+}
